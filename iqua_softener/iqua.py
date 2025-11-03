@@ -1,20 +1,28 @@
 import logging
+import time
+import json
+import os
 from enum import Enum, IntEnum
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional, Dict
+from datetime import datetime
+from typing import Optional, Dict, Any
+
 try:
     from zoneinfo import ZoneInfo
-except:
+except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 import requests
 
+try:
+    import jwt  # optional (PyJWT)
+except ImportError:
+    jwt = None
+
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_API_BASE_URL = "https://apioem.ecowater.com/v1"
-DEFAULT_USER_AGENT = "okhttp/4.9.1"
+DEFAULT_API_BASE_URL = "https://api.myiquaapp.com/v1"
 
 
 class IquaSoftenerState(str, Enum):
@@ -57,135 +65,323 @@ class IquaSoftener:
         password: str,
         device_serial_number: str,
         api_base_url: str = DEFAULT_API_BASE_URL,
-        user_agent: str = DEFAULT_USER_AGENT,
     ):
         self._username: str = username
         self._password: str = password
         self._device_serial_number = device_serial_number
         self._api_base_url: str = api_base_url
-        self._user_agent: str = user_agent
-        self._token: Optional[str] = None
-        self._token_type: Optional[str] = None
-        self._token_expiration_timestamp: Optional[datetime] = None
+        self._session: Optional[requests.Session] = None
+        self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._user_id: Optional[str] = None
+        self._access_expires_at: Optional[int] = None
+        self._device_id: Optional[str] = None  # Cache the device ID
 
     @property
     def device_serial_number(self) -> str:
         return self._device_serial_number
 
     def get_data(self) -> IquaSoftenerData:
-        with requests.Session() as session:
-            self._check_token(session)
-            url = self._get_url(f"system/{self._device_serial_number}/dashboard")
-            headers = self._get_headers()
-            response = session.get(url, headers=headers)
-            if response.status_code == 401:
-                self._update_token(session)
-                response = session.get(url, headers=headers)
-            elif response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for data request"
-                )
-            if response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for data request"
-                )
-            response_data = response.json()
-            if response_data.get("code") != "OK":
-                raise IquaSoftenerException(
-                    f'Invalid response code for data request: {response_data["code"]} ({response_data["message"]})'
-                )
-            data = response_data["data"]
-            return IquaSoftenerData(
-                timestamp=datetime.now(),
-                model=f'{data["modelDescription"]["value"]} ({data["modelId"]["value"]})',
-                state=IquaSoftenerState(data["power"]),
-                device_date_time=datetime.fromisoformat(
-                    data["deviceDate"][: len(data["deviceDate"]) - 1]
-                ).replace(tzinfo=ZoneInfo(data["timeZoneEnum"]["value"])),
-                volume_unit=IquaSoftenerVolumeUnit(
-                    int(data["volumeUnitEnum"]["value"])
-                ),
-                current_water_flow=float(data["currentWaterFlow"]["value"]),
-                today_use=int(data["gallonsUsedToday"]["value"]),
-                average_daily_use=int(data["avgDailyUseGallons"]["value"]),
-                total_water_available=int(data["totalWaterAvailGals"]["value"]),
-                days_since_last_regeneration=int(data["daysSinceLastRegen"]["value"]),
-                salt_level=int(int(data["saltLevelTenths"]["value"]) / 10),
-                salt_level_percent=int(data["saltLevelTenths"]["percent"]),
-                out_of_salt_estimated_days=int(data["outOfSaltEstDays"]["value"]),
-                hardness_grains=int(data["hardnessGrains"]["value"]),
-                water_shutoff_valve_state=int(data["waterShutoffValveReq"]["value"])
-            )
+        device_id = self._get_device_id()
+        device = self._get_device_detail(device_id)
+        props = device.get("properties", {})
+        enriched = device.get("enriched_data", {}).get("water_treatment", {})
+
+        def val(name: str, default=None):
+            return props.get(name, {}).get("value", default)
+
+        model_desc = val("model_description", "Unknown Model")
+        model_id = val("model_id", "N/A")
+
+        # Get device date from properties or use current time
+        device_date_str = val("device_date")
+        if device_date_str:
+            try:
+                # Parse the device date, assuming it's in ISO format
+                device_date_time = datetime.fromisoformat(
+                    device_date_str.rstrip("Z")
+                ).replace(tzinfo=ZoneInfo("UTC"))
+            except (ValueError, AttributeError):
+                device_date_time = datetime.now(tz=ZoneInfo("UTC"))
+        else:
+            device_date_time = datetime.now(tz=ZoneInfo("UTC"))
+
+        return IquaSoftenerData(
+            timestamp=datetime.now(),
+            model=f"{model_desc} ({model_id})",
+            state=(
+                IquaSoftenerState.ONLINE
+                if val("service_active", True)
+                else IquaSoftenerState.OFFLINE
+            ),
+            device_date_time=device_date_time,
+            volume_unit=IquaSoftenerVolumeUnit(int(val("volume_unit_enum", 0))),
+            current_water_flow=float(
+                props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
+            ),
+            today_use=int(val("gallons_used_today", 0)),
+            average_daily_use=int(val("avg_daily_use_gals", 0)),
+            total_water_available=int(val("treated_water_avail_gals", 0)),
+            days_since_last_regeneration=int(val("days_since_last_regen", 0)),
+            salt_level=int(val("salt_level_tenths", 0) / 10),
+            salt_level_percent=int(enriched.get("salt_level_percent", 0)),
+            out_of_salt_estimated_days=int(val("out_of_salt_estimate_days", 0)),
+            hardness_grains=int(val("hardness_grains", 0)),
+            water_shutoff_valve_state=int(val("water_shutoff_valve", 0)),
+        )
+
+    def get_flow_and_salt(self) -> dict:
+        """Return just flow (gpm) and salt level percent for quick dashboards."""
+        device_id = self._get_device_id()
+        device = self._get_device_detail(device_id)
+        props = device.get("properties", {})
+        flow = props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
+        salt = (
+            device.get("enriched_data", {})
+            .get("water_treatment", {})
+            .get("salt_level_percent")
+        )
+        return {"flow_gpm": flow, "salt_percent": salt}
 
     def set_water_shutoff_valve(self, state: int):
         if state not in (0, 1):
-            raise ValueError("Invalid state for water shut off valve (should be 0 or 1).")
-        with requests.Session() as session:
-            self._check_token(session)
-            url = self._get_url(f"system/{self._device_serial_number}/properties")
-            headers = self._get_headers()
-            json = {"waterShutoffValve": state}
-            response = session.put(url, json=json, headers=headers)
-            if response.status_code == 401:
-                self._update_token(session)
-                response = session.put(url, json=json, headers=headers)
-            elif response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for set water shutoff valve request"
-                )
-            if response.status_code != 200:
-                raise IquaSoftenerException(
-                    f"Invalid status ({response.status_code}) for set water shutoff valve request"
-                )
-            response_data = response.json()
-            if response_data.get("code") != "OK":
-                raise IquaSoftenerException(
-                    f'Invalid response code for set water shutoff valve request: {response_data["code"]} '
-                    f'({response_data["message"]})'
-                )
-
-    def _check_token(self, session: requests.Session):
-        if self._token is None or (
-                self._token_expiration_timestamp is not None
-                and datetime.now() > self._token_expiration_timestamp
-        ):
-            self._update_token(session)
-
-    def _update_token(self, session: requests.Session):
-        try:
-            response = session.post(
-                self._get_url("auth/signin"),
-                json=dict(username=self._username, password=self._password),
-                headers=self._get_headers(with_authorization=False),
+            raise ValueError(
+                "Invalid state for water shut off valve (should be 0 or 1)."
             )
-        except requests.exceptions.RequestException as ex:
-            raise IquaSoftenerException(f"Exception on token request ({ex})")
-        if response.status_code == 401:
-            raise IquaSoftenerException(f"Authentication error ({response.text})")
+
+        device_id = self._get_device_id()
+        url = f"/devices/{device_id}/command"
+
+        # Convert state to action string
+        action = "close" if state == 1 else "open"
+        payload = {"function": "water_shutoff_valve", "action": action}
+
+        response = self._request("PUT", url, json=payload)
         if response.status_code != 200:
             raise IquaSoftenerException(
-                f"Invalid status ({response.status_code}) for token request"
+                f"Invalid status ({response.status_code}) for set water shutoff valve request"
             )
         response_data = response.json()
-        if response_data.get("code") != "OK":
+        return response_data
+
+    def open_water_shutoff_valve(self):
+        """Open the water shutoff valve (allow water flow)."""
+        return self.set_water_shutoff_valve(0)
+
+    def close_water_shutoff_valve(self):
+        """Close the water shutoff valve (stop water flow)."""
+        return self.set_water_shutoff_valve(1)
+
+    def schedule_regeneration(self):
+        """Schedule a regeneration cycle for the water softener."""
+        device_id = self._get_device_id()
+        url = f"/devices/{device_id}/command"
+        payload = {"function": "regenerate", "action": "schedule"}
+
+        response = self._request("PUT", url, json=payload)
+        if response.status_code != 200:
             raise IquaSoftenerException(
-                f'Invalid response code for token request: {response_data["code"]} ({response_data["message"]})'
+                f"Invalid status ({response.status_code}) for schedule regeneration request"
             )
-        self._token = response_data["data"]["token"]
-        self._token_type = response_data["data"]["tokenType"]
-        self._token_expiration_timestamp = datetime.now() + timedelta(
-            seconds=int(response_data["data"]["expiresIn"])
+        response_data = response.json()
+        return response_data
+
+    def cancel_scheduled_regeneration(self):
+        """Cancel a scheduled regeneration cycle."""
+        device_id = self._get_device_id()
+        url = f"/devices/{device_id}/command"
+        payload = {"function": "regenerate", "action": "cancel"}
+
+        response = self._request("PUT", url, json=payload)
+        if response.status_code != 200:
+            raise IquaSoftenerException(
+                f"Invalid status ({response.status_code}) for cancel regeneration request"
+            )
+        response_data = response.json()
+        return response_data
+
+    def regenerate_now(self):
+        """Start a regeneration cycle immediately."""
+        device_id = self._get_device_id()
+        url = f"/devices/{device_id}/command"
+        payload = {"function": "regenerate", "action": "regenerate"}
+
+        response = self._request("PUT", url, json=payload)
+        if response.status_code != 200:
+            raise IquaSoftenerException(
+                f"Invalid status ({response.status_code}) for regenerate now request"
+            )
+        response_data = response.json()
+        return response_data
+
+    def get_devices(self) -> list:
+        """Get list of all devices for the authenticated user."""
+        return self._get_devices()
+
+    def get_device_id(self) -> str:
+        """Get the device ID for the configured serial number."""
+        return self._get_device_id()
+
+    def save_tokens(self, path: str):
+        """Save authentication tokens to a file."""
+        with open(path, "w") as f:
+            json.dump(
+                {
+                    "access_token": self._access_token,
+                    "refresh_token": self._refresh_token,
+                    "user_id": self._user_id,
+                    "_access_expires_at": self._access_expires_at,
+                },
+                f,
+            )
+
+    def load_tokens(self, path: str):
+        """Load authentication tokens from a file."""
+        if not os.path.exists(path):
+            return
+        with open(path, "r") as f:
+            data = json.load(f)
+        self._access_token = data.get("access_token")
+        self._refresh_token = data.get("refresh_token")
+        self._user_id = data.get("user_id")
+        self._access_expires_at = data.get("_access_expires_at")
+
+    def _get_device_id(self) -> str:
+        """Get the device ID for the configured serial number."""
+        if self._device_id is not None:
+            return self._device_id
+
+        # Get all devices and find the one with matching serial number
+        devices = self._get_devices()
+        for device in devices:
+            # Check serial_number field
+            device_serial = (
+                device.get("properties", {}).get("serial_number", {}).get("value")
+            )
+
+            if device_serial == self._device_serial_number:
+                self._device_id = device["id"]
+                return self._device_id
+
+        raise IquaSoftenerException(
+            f"Device with serial number '{self._device_serial_number}' not found"
         )
 
-    def _get_url(self, resource: str) -> str:
-        return f"{self._api_base_url}/{resource}"
+    def _get_devices(self) -> list:
+        """Get list of all devices for the authenticated user."""
+        r = self._request("GET", "/devices")
+        data = r.json()
+        return data.get("data", [])
 
-    def _get_headers(self, with_authorization: bool = True) -> Dict[str, str]:
-        headers = {"User-Agent": self._user_agent}
-        if (
-            with_authorization is True
-            and self._token is not None
-            and self._token_type is not None
-        ):
-            headers["Authorization"] = f"{self._token_type} {self._token}"
-        return headers
+    def _ensure_session(self):
+        """Ensure we have a session object."""
+        if self._session is None:
+            self._session = requests.Session()
+
+    def _set_tokens(self, access_token: str, refresh_token: Optional[str]):
+        """Set authentication tokens and update session headers."""
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        if jwt:
+            try:
+                decoded = jwt.decode(access_token, options={"verify_signature": False})
+                exp = decoded.get("exp")
+                if exp:
+                    self._access_expires_at = int(exp) - 60
+            except Exception:
+                self._access_expires_at = None
+
+        self._ensure_session()
+        if self._access_token:
+            self._session.headers.update(
+                {"Authorization": f"Bearer {self._access_token}"}
+            )
+
+    def _is_token_expired(self) -> bool:
+        """Check if the current access token is expired."""
+        if not self._access_token:
+            return True
+        if self._access_expires_at is None:
+            return False
+        return time.time() >= self._access_expires_at
+
+    def _login(self) -> Dict[str, Any]:
+        """Authenticate with the API and get tokens."""
+        self._ensure_session()
+        url = f"{self._api_base_url}/auth/login"
+        payload = {"email": self._username, "password": self._password}
+        try:
+            r = self._session.post(url, json=payload, timeout=15)
+        except requests.exceptions.RequestException as ex:
+            raise IquaSoftenerException(f"Exception on login request ({ex})")
+
+        if r.status_code == 401:
+            raise IquaSoftenerException(f"Authentication error ({r.text})")
+        if r.status_code != 200:
+            raise IquaSoftenerException(f"Login failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        self._set_tokens(data.get("access_token"), data.get("refresh_token"))
+        self._user_id = data.get("user_id")
+        return data
+
+    def _refresh_token(self) -> Dict[str, Any]:
+        """Refresh the access token using the refresh token."""
+        if not self._refresh_token:
+            raise IquaSoftenerException("No refresh token available")
+
+        self._ensure_session()
+        url = f"{self._api_base_url}/auth/refresh"
+        payload = {"refresh_token": self._refresh_token}
+        try:
+            r = self._session.post(url, json=payload, timeout=15)
+        except requests.exceptions.RequestException as ex:
+            raise IquaSoftenerException(f"Exception on token refresh ({ex})")
+
+        if r.status_code != 200:
+            raise IquaSoftenerException(f"Refresh failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        self._set_tokens(data.get("access_token"), data.get("refresh_token"))
+        return data
+
+    def _ensure_authenticated(self):
+        """Ensure we have a valid authentication token."""
+        if self._is_token_expired():
+            try:
+                if self._refresh_token:
+                    self._refresh_token()
+                else:
+                    self._login()
+            except IquaSoftenerException:
+                self._login()
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """Make an authenticated request to the API."""
+        self._ensure_authenticated()
+        self._ensure_session()
+
+        url = (
+            path
+            if path.startswith("http")
+            else f"{self._api_base_url.rstrip('/')}/{path.lstrip('/')}"
+        )
+
+        r = self._session.request(method, url, timeout=20, **kwargs)
+        if r.status_code == 401 and self._refresh_token:
+            try:
+                self._refresh_token()
+                r = self._session.request(method, url, timeout=20, **kwargs)
+            except IquaSoftenerException:
+                self._login()
+                r = self._session.request(method, url, timeout=20, **kwargs)
+
+        if r.status_code != 200:
+            r.raise_for_status()
+        return r
+
+    def _get_device_detail(self, device_id: str) -> dict:
+        """Get detailed device information."""
+        r = self._request("GET", f"/devices/{device_id}/detail-or-summary")
+        data = r.json()
+        return data.get("device", {})
