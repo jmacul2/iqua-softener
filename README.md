@@ -276,4 +276,4 @@ softener.stop_websocket()
 
 ## Contributing
 
-This library was enhanced by Jay McEntire (jay.mcentire@usu.edu) based on the original work by Artur Zabroński. Contributions and improvements are welcome!
+This library was enhanced by Jay McEntire (jay.mcentire@gmail.com) based on the original work by Artur Zabroński. Contributions and improvements are welcome!
