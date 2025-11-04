@@ -163,7 +163,7 @@ class IquaSoftener:
             salt_level_percent=int(enriched.get("salt_level_percent", 0)),
             out_of_salt_estimated_days=int(val("out_of_salt_estimate_days", 0)),
             hardness_grains=int(val("hardness_grains", 0)),
-            water_shutoff_valve_state=int(val("water_shutoff_valve", 0)),
+            water_shutoff_valve_state=self._get_water_shutoff_valve_state(props),
         )
 
     def get_flow_and_salt(self) -> dict:
@@ -200,8 +200,8 @@ class IquaSoftener:
         device_id = self._get_device_id()
         url = f"/devices/{device_id}/command"
 
-        # Convert state to action string: 1 = closed, 0 = open
-        action = "close" if state == 1 else "open"
+        # Convert state to action string: 1 = open, 0 = closed
+        action = "open" if state == 1 else "close"
         payload = {"function": "water_shutoff_valve", "action": action}
 
         response = self._request("PUT", url, json=payload)
@@ -213,12 +213,12 @@ class IquaSoftener:
         return response_data
 
     def open_water_shutoff_valve(self):
-        """Open the water shutoff valve (allow water flow) - state 0."""
-        return self.set_water_shutoff_valve(0)
+        """Open the water shutoff valve (allow water flow) - state 1."""
+        return self.set_water_shutoff_valve(1)
 
     def close_water_shutoff_valve(self):
-        """Close the water shutoff valve (stop water flow) - state 1."""
-        return self.set_water_shutoff_valve(1)
+        """Close the water shutoff valve (stop water flow) - state 0."""
+        return self.set_water_shutoff_valve(0)
 
     def schedule_regeneration(self):
         """Schedule a regeneration cycle for the water softener."""
@@ -429,6 +429,16 @@ class IquaSoftener:
         self._refresh_token = data.get("refresh_token")
         self._user_id = data.get("user_id")
         self._access_expires_at = data.get("_access_expires_at")
+
+    def _get_water_shutoff_valve_state(self, props: dict) -> int:
+        """Parse water shutoff valve state from API properties."""
+        valve_data = props.get("water_shutoff_valve", {})
+        if isinstance(valve_data, dict):
+            status = valve_data.get("status", "closed")
+            # Convert status string to int: "open" = 1, "closed" = 0
+            return 1 if status == "open" else 0
+        # Fallback for legacy numeric format
+        return int(valve_data) if valve_data is not None else 0
 
     def _get_device_id(self) -> str:
         """Get the device ID for the configured serial number."""
