@@ -2,10 +2,12 @@ import logging
 import time
 import json
 import os
+import threading
+import asyncio
 from enum import Enum, IntEnum
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 
 try:
     from zoneinfo import ZoneInfo
@@ -18,6 +20,11 @@ try:
     import jwt  # optional (PyJWT)
 except ImportError:
     jwt = None
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,8 @@ class IquaSoftener:
         password: str,
         device_serial_number: str,
         api_base_url: str = DEFAULT_API_BASE_URL,
+        enable_websocket: bool = True,
+        external_realtime_data: Optional[Dict[str, Any]] = None,
     ):
         self._username: str = username
         self._password: str = password
@@ -76,6 +85,19 @@ class IquaSoftener:
         self._user_id: Optional[str] = None
         self._access_expires_at: Optional[int] = None
         self._device_id: Optional[str] = None  # Cache the device ID
+
+        # WebSocket support
+        self._enable_websocket = enable_websocket and websockets is not None
+        self._websocket_uri: Optional[str] = None
+        self._websocket_task: Optional[asyncio.Task] = None
+        self._websocket_thread: Optional[threading.Thread] = None
+        self._websocket_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._realtime_data: Dict[str, Any] = {}
+        self._websocket_running = False
+        self._websocket_lock = threading.Lock()
+
+        # External real-time data (for Home Assistant integration)
+        self._external_realtime_data = external_realtime_data
 
     @property
     def device_serial_number(self) -> str:
@@ -89,6 +111,15 @@ class IquaSoftener:
 
         def val(name: str, default=None):
             return props.get(name, {}).get("value", default)
+
+        def realtime_val(name: str, fallback_name: str = None, default=None):
+            """Get value from real-time data if available, otherwise fallback to API data."""
+            realtime_value = self.get_realtime_property(name)
+            if realtime_value is not None:
+                return realtime_value
+            if fallback_name:
+                return val(fallback_name, default)
+            return val(name, default)
 
         model_desc = val("model_description", "Unknown Model")
         model_id = val("model_id", "N/A")
@@ -106,18 +137,23 @@ class IquaSoftener:
         else:
             device_date_time = datetime.now(tz=ZoneInfo("UTC"))
 
+        # Use real-time service_active if available
+        service_active = realtime_val("service_active", "service_active", True)
+
         return IquaSoftenerData(
             timestamp=datetime.now(),
             model=f"{model_desc} ({model_id})",
             state=(
                 IquaSoftenerState.ONLINE
-                if val("service_active", True)
+                if service_active
                 else IquaSoftenerState.OFFLINE
             ),
             device_date_time=device_date_time,
             volume_unit=IquaSoftenerVolumeUnit(int(val("volume_unit_enum", 0))),
+            # Use real-time current_water_flow if available
             current_water_flow=float(
-                props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
+                realtime_val("current_water_flow_gpm")
+                or props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
             ),
             today_use=int(val("gallons_used_today", 0)),
             average_daily_use=int(val("avg_daily_use_gals", 0)),
@@ -132,15 +168,27 @@ class IquaSoftener:
 
     def get_flow_and_salt(self) -> dict:
         """Return just flow (gpm) and salt level percent for quick dashboards."""
+        # Try to get real-time flow first
+        realtime_flow = self.get_realtime_property("current_water_flow_gpm")
+
+        if realtime_flow is not None:
+            flow = realtime_flow
+        else:
+            # Fallback to API data
+            device_id = self._get_device_id()
+            device = self._get_device_detail(device_id)
+            props = device.get("properties", {})
+            flow = props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
+
+        # Salt level is typically not real-time, so get from API
         device_id = self._get_device_id()
         device = self._get_device_detail(device_id)
-        props = device.get("properties", {})
-        flow = props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
         salt = (
             device.get("enriched_data", {})
             .get("water_treatment", {})
             .get("salt_level_percent")
         )
+
         return {"flow_gpm": flow, "salt_percent": salt}
 
     def set_water_shutoff_valve(self, state: int):
@@ -221,6 +269,142 @@ class IquaSoftener:
     def get_device_id(self) -> str:
         """Get the device ID for the configured serial number."""
         return self._get_device_id()
+
+    def start_websocket(self):
+        """Start WebSocket connection for real-time updates."""
+        if not self._enable_websocket:
+            logger.warning(
+                "WebSocket support is disabled or websockets library not available"
+            )
+            return
+
+        if self._websocket_running:
+            logger.info("WebSocket already running")
+            return
+
+        self._websocket_running = True
+        self._websocket_thread = threading.Thread(
+            target=self._run_websocket_thread, daemon=True
+        )
+        self._websocket_thread.start()
+
+    def stop_websocket(self):
+        """Stop WebSocket connection."""
+        if not self._websocket_running:
+            return
+
+        self._websocket_running = False
+
+        if self._websocket_loop and self._websocket_task:
+            self._websocket_loop.call_soon_threadsafe(self._websocket_task.cancel)
+
+        if self._websocket_thread:
+            self._websocket_thread.join(timeout=5)
+
+    def get_realtime_property(self, property_name: str) -> Optional[Any]:
+        """Get a real-time property value from WebSocket data."""
+        # Check external real-time data first (for Home Assistant integration)
+        if self._external_realtime_data:
+            prop_data = self._external_realtime_data.get(property_name)
+            if prop_data:
+                if prop_data.get("converted_property"):
+                    return prop_data["converted_property"]["value"]
+                return prop_data.get("value")
+
+        # Fall back to internal WebSocket data
+        with self._websocket_lock:
+            prop_data = self._realtime_data.get(property_name)
+            if prop_data:
+                # Return converted_value if available, otherwise raw value
+                if prop_data.get("converted_property"):
+                    return prop_data["converted_property"]["value"]
+                return prop_data.get("value")
+            return None
+
+    def update_external_realtime_data(self, realtime_data: Dict[str, Any]):
+        """Update external real-time data (for Home Assistant integration)."""
+        self._external_realtime_data = realtime_data
+
+    def get_websocket_uri(self) -> Optional[str]:
+        """Get WebSocket URI for external use (like Home Assistant integration)."""
+        try:
+            device_id = self._get_device_id()
+            response = self._request("GET", f"/devices/{device_id}/live")
+            data = response.json()
+            ws_uri = data.get("websocket_uri")
+            if ws_uri:
+                return f"wss://api.myiquaapp.com{ws_uri}"
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get WebSocket URI: {e}")
+            return None
+
+    def _run_websocket_thread(self):
+        """Run WebSocket client in a separate thread."""
+        try:
+            self._websocket_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._websocket_loop)
+            self._websocket_loop.run_until_complete(self._websocket_client())
+        except Exception as e:
+            logger.error(f"WebSocket thread error: {e}")
+        finally:
+            if self._websocket_loop:
+                self._websocket_loop.close()
+
+    async def _websocket_client(self):
+        """WebSocket client coroutine."""
+        while self._websocket_running:
+            try:
+                # Get WebSocket URI
+                ws_uri = await self._get_websocket_uri()
+                if not ws_uri:
+                    await asyncio.sleep(30)
+                    continue
+
+                full_uri = f"wss://api.myiquaapp.com{ws_uri}"
+                logger.info(f"Connecting to WebSocket: {full_uri}")
+
+                async with websockets.connect(full_uri) as websocket:
+                    logger.info("WebSocket connected successfully")
+                    self._websocket_task = asyncio.current_task()
+
+                    async for message in websocket:
+                        if not self._websocket_running:
+                            break
+
+                        try:
+                            data = json.loads(message)
+                            await self._handle_websocket_message(data)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Failed to parse WebSocket message: {e}")
+                        except Exception as e:
+                            logger.error(f"Error handling WebSocket message: {e}")
+
+            except Exception as e:
+                logger.error(f"WebSocket connection error: {e}")
+                if self._websocket_running:
+                    await asyncio.sleep(10)  # Wait before reconnecting
+
+    async def _get_websocket_uri(self) -> Optional[str]:
+        """Get WebSocket URI from the API."""
+        try:
+            device_id = self._get_device_id()
+            response = self._request("GET", f"/devices/{device_id}/live")
+            data = response.json()
+            return data.get("websocket_uri")
+        except Exception as e:
+            logger.error(f"Failed to get WebSocket URI: {e}")
+            return None
+
+    async def _handle_websocket_message(self, data: Dict[str, Any]):
+        """Handle incoming WebSocket message."""
+        if data.get("type") == "property" and "name" in data:
+            property_name = data["name"]
+            with self._websocket_lock:
+                self._realtime_data[property_name] = data
+            logger.debug(
+                f"Updated real-time property: {property_name} = {data.get('value')}"
+            )
 
     def save_tokens(self, path: str):
         """Save authentication tokens to a file."""

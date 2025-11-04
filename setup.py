@@ -32,8 +32,9 @@ setup(
     ],
     python_requires=">=3.7",
     install_requires=[
-        "requests>=2.25.0",
-        "PyJWT>=2.0.0",
+        "requests",
+        "PyJWT",
+        "websockets",
     ],
     extras_require={
         "dev": ["pytest", "black", "flake8"],
