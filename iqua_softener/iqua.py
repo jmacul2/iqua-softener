@@ -451,8 +451,6 @@ class IquaSoftener:
         # Check enriched_data first (this is where it should be)
         enriched = device.get("enriched_data", {}).get("water_treatment", {})
         valve_data = enriched.get("water_shutoff_valve", {})
-        print(enriched)
-        print(valve_data)
         # If not in enriched_data, check properties as fallback
         if not valve_data:
             props = device.get("properties", {})
