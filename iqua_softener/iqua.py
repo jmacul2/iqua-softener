@@ -112,6 +112,10 @@ class IquaSoftener:
         def val(name: str, default=None):
             return props.get(name, {}).get("value", default)
 
+        def enriched_val(name: str, default=None):
+            """Get value from enriched_data."""
+            return enriched.get(name, default)
+
         def realtime_val(name: str, fallback_name: str = None, default=None):
             """Get value from real-time data if available, otherwise fallback to API data."""
             realtime_value = self.get_realtime_property(name)
@@ -155,15 +159,27 @@ class IquaSoftener:
                 realtime_val("current_water_flow_gpm")
                 or props.get("current_water_flow_gpm", {}).get("converted_value", 0.0)
             ),
-            today_use=int(val("gallons_used_today", 0)),
+            # Use enriched_data for today's usage if available
+            today_use=int(
+                enriched_val("gallons_used_today") or val("gallons_used_today", 0)
+            ),
             average_daily_use=int(val("avg_daily_use_gals", 0)),
-            total_water_available=int(val("treated_water_avail_gals", 0)),
-            days_since_last_regeneration=int(val("days_since_last_regen", 0)),
+            # Use enriched_data for treated water available
+            total_water_available=int(
+                enriched_val("treated_water_available", {}).get("value")
+                or val("treated_water_avail_gals", 0)
+            ),
+            # Use enriched_data for days since last regeneration
+            days_since_last_regeneration=int(
+                enriched_val("days_since_last_recharge")
+                or val("days_since_last_regen", 0)
+            ),
             salt_level=int(val("salt_level_tenths", 0) / 10),
-            salt_level_percent=int(enriched.get("salt_level_percent", 0)),
+            # Use enriched_data for salt level percent
+            salt_level_percent=int(enriched_val("salt_level_percent") or 0),
             out_of_salt_estimated_days=int(val("out_of_salt_estimate_days", 0)),
             hardness_grains=int(val("hardness_grains", 0)),
-            water_shutoff_valve_state=self._get_water_shutoff_valve_state(props),
+            water_shutoff_valve_state=self._get_water_shutoff_valve_state(device),
         )
 
     def get_flow_and_salt(self) -> dict:
@@ -430,9 +446,22 @@ class IquaSoftener:
         self._user_id = data.get("user_id")
         self._access_expires_at = data.get("_access_expires_at")
 
-    def _get_water_shutoff_valve_state(self, props: dict) -> int:
-        """Parse water shutoff valve state from API properties."""
-        valve_data = props.get("water_shutoff_valve", {})
+    def _get_water_shutoff_valve_state(self, device: dict) -> int:
+        """Parse water shutoff valve state from API device data."""
+        # Check enriched_data first (this is where it should be)
+        enriched = device.get("enriched_data", {}).get("water_treatment", {})
+        valve_data = enriched.get("water_shutoff_valve", {})
+        print(enriched)
+        print(valve_data)
+        # If not in enriched_data, check properties as fallback
+        if not valve_data:
+            props = device.get("properties", {})
+            valve_data = props.get("water_shutoff_valve", {})
+
+        # If still not found, check device root level
+        if not valve_data:
+            valve_data = device.get("water_shutoff_valve", {})
+
         if isinstance(valve_data, dict):
             status = valve_data.get("status", "closed")
             # Convert status string to int: "open" = 1, "closed" = 0
