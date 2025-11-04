@@ -194,13 +194,13 @@ class IquaSoftener:
     def set_water_shutoff_valve(self, state: int):
         if state not in (0, 1):
             raise ValueError(
-                "Invalid state for water shut off valve (should be 0 or 1)."
+                "Invalid state for water shutoff valve (should be 0 or 1)."
             )
 
         device_id = self._get_device_id()
         url = f"/devices/{device_id}/command"
 
-        # Convert state to action string
+        # Convert state to action string: 1 = closed, 0 = open
         action = "close" if state == 1 else "open"
         payload = {"function": "water_shutoff_valve", "action": action}
 
@@ -213,11 +213,11 @@ class IquaSoftener:
         return response_data
 
     def open_water_shutoff_valve(self):
-        """Open the water shutoff valve (allow water flow)."""
+        """Open the water shutoff valve (allow water flow) - state 0."""
         return self.set_water_shutoff_valve(0)
 
     def close_water_shutoff_valve(self):
-        """Close the water shutoff valve (stop water flow)."""
+        """Close the water shutoff valve (stop water flow) - state 1."""
         return self.set_water_shutoff_valve(1)
 
     def schedule_regeneration(self):
