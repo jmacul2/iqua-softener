@@ -546,7 +546,7 @@ class IquaSoftener:
         self._user_id = data.get("user_id")
         return data
 
-    def _refresh_token(self) -> Dict[str, Any]:
+    def _refresh_access_token(self) -> Dict[str, Any]:
         """Refresh the access token using the refresh token."""
         if not self._refresh_token:
             raise IquaSoftenerException("No refresh token available")
@@ -571,7 +571,7 @@ class IquaSoftener:
         if self._is_token_expired():
             try:
                 if self._refresh_token:
-                    self._refresh_token()
+                    self._refresh_access_token()
                 else:
                     self._login()
             except IquaSoftenerException:
@@ -591,7 +591,7 @@ class IquaSoftener:
         r = self._session.request(method, url, timeout=20, **kwargs)
         if r.status_code == 401 and self._refresh_token:
             try:
-                self._refresh_token()
+                self._refresh_access_token()
                 r = self._session.request(method, url, timeout=20, **kwargs)
             except IquaSoftenerException:
                 self._login()
