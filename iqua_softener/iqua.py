@@ -95,6 +95,8 @@ class IquaSoftener:
         self._realtime_data: Dict[str, Any] = {}
         self._websocket_running = False
         self._websocket_lock = threading.Lock()
+        self._websocket_connected_at: Optional[float] = None
+        self._websocket_max_duration = 170  # Reconnect after 170 seconds (before 3 min timeout)
 
         # External real-time data (for Home Assistant integration)
         self._external_realtime_data = external_realtime_data
@@ -383,10 +385,21 @@ class IquaSoftener:
                 async with websockets.connect(full_uri) as websocket:
                     logger.info("WebSocket connected successfully")
                     self._websocket_task = asyncio.current_task()
+                    self._websocket_connected_at = time.time()
 
                     async for message in websocket:
                         if not self._websocket_running:
                             break
+
+                        # Check if we've been connected too long (proactive reconnect)
+                        if self._websocket_connected_at:
+                            connection_duration = time.time() - self._websocket_connected_at
+                            if connection_duration >= self._websocket_max_duration:
+                                logger.info(
+                                    f"WebSocket connection duration ({connection_duration:.1f}s) "
+                                    f"exceeded max ({self._websocket_max_duration}s), reconnecting..."
+                                )
+                                break
 
                         try:
                             data = json.loads(message)
@@ -398,6 +411,7 @@ class IquaSoftener:
 
             except Exception as e:
                 logger.error(f"WebSocket connection error: {e}")
+                self._websocket_connected_at = None
                 if self._websocket_running:
                     await asyncio.sleep(10)  # Wait before reconnecting
 
