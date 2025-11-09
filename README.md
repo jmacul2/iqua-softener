@@ -5,6 +5,7 @@ A comprehensive Python library for interacting with iQua water softeners through
 ## Features
 
 - **Device Data Retrieval** - Get comprehensive water softener status and metrics
+- **Flexible Device Identification** - Support for both device serial number and product serial number
 - **Water Shutoff Valve Control** - Open/close water shutoff valves remotely
 - **Regeneration Management** - Schedule, cancel, and trigger regeneration cycles
 - **Real-time Data** - WebSocket support for live water flow and device status updates
@@ -23,11 +24,18 @@ pip install iqua_softener
 ```python
 from iqua_softener import IquaSoftener
 
-# Initialize the softener client
+# Initialize the softener client (using device serial number)
 softener = IquaSoftener(
     username='your_email@example.com',
     password='your_password', 
     device_serial_number='your_device_serial'
+)
+
+# OR initialize using product serial number
+softener = IquaSoftener(
+    username='your_email@example.com',
+    password='your_password', 
+    product_serial_number='RHW4221-22110-3187'
 )
 
 # Get current device data
@@ -44,14 +52,27 @@ print(f"Water available: {data.total_water_available} gallons")
 #### Initialize Client
 
 ```python
+# Option 1: Initialize with device serial number
 softener = IquaSoftener(
     username='email@example.com',           # Your iQua account email
     password='password',                    # Your iQua account password  
-    device_serial_number='ABC123',          # Device serial number
+    device_serial_number='ABC123',          # Device serial number (optional if product_serial_number provided)
     api_base_url='https://api.myiquaapp.com/v1',  # Optional: API base URL
     enable_websocket=True,                  # Optional: Enable real-time data
     external_realtime_data=None             # Optional: For Home Assistant integration
 )
+
+# Option 2: Initialize with product serial number
+softener = IquaSoftener(
+    username='email@example.com',           # Your iQua account email
+    password='password',                    # Your iQua account password  
+    product_serial_number='RHW4221-22110-3187',  # Product serial number (optional if device_serial_number provided)
+    api_base_url='https://api.myiquaapp.com/v1',  # Optional: API base URL
+    enable_websocket=True,                  # Optional: Enable real-time data
+    external_realtime_data=None             # Optional: For Home Assistant integration
+)
+
+# Note: At least one serial number (device or product) must be provided
 ```
 
 #### Get Device Data
